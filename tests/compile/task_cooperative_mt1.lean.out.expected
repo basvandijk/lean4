@@ -1,0 +1,63 @@
+== sync-inline
+before resolve
+sync continuation (some 1)
+after resolve
+result: ok 1
+task: before resolve
+sync continuation (some 2)
+task: after resolve
+result: ok 2
+sync on finished 3
+result: ok 3
+end
+== bind-pending-pq
+setup done
+p continuation (some 1)
+q continuation (some 2)
+result: ok 3
+== bind-pending-qp
+setup done
+p continuation (some 1)
+q continuation (some 2)
+result: ok 3
+== async-do
+segment 0
+setup done
+segment 1: 1
+segment 2: 2
+segment 3: 3
+result: ok 6
+== loops
+setup done
+for: 1
+for: 2
+for: 3
+repeat: 0
+repeat: 1
+result: ok 6
+== try-catch
+setup done
+caught: failed after 1
+result: ok 0
+== reentrant
+setup done
+p continuation (some 3)
+after resolve q
+q continuation (some 7)
+done
+== consumer-first
+result: ok (some 1)
+== cancel
+canceled: true
+== cancel-propagates
+canceled: true
+== deep-10000
+deep 10000: (some 10000)
+== heartbeats-nested
+100000 100000 100000 before true across true after true task true
+== streams-nested
+from task
+buffer: captured
+== wait-any
+first: ok 7
+result: ok 9

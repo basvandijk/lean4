@@ -234,7 +234,8 @@ namespace BaseIO
 Runs `act` in a separate `Task`, with priority `prio`.
 
 Running the resulting `BaseIO` action causes the task to be started eagerly. Pure accesses to the
-`Task` do not influence the impure `act`.
+`Task` do not influence the impure `act`. On a cooperative task manager (no worker threads, see
+`Task`), the task is queued and starts at the next wait, `IO.sleep`, or program exit.
 
 Unlike pure tasks created by `Task.spawn`, tasks created by this function will run even if the last
 reference to the task is dropped. The `act` should explicitly check for cancellation via
@@ -429,6 +430,9 @@ If `nBytes` is `0`, returns immediately with an empty buffer.
 
 /--
 Pauses execution for the specified number of milliseconds.
+
+On a cooperative task manager (no worker threads, see `Task`), the queued tasks run first, so that a
+loop that polls `IO.getTaskState` between sleeps makes progress; do not hold a `Std.Mutex` across it.
 -/
 opaque sleep (ms : UInt32) : BaseIO Unit :=
   -- TODO: add a proper primitive for IO.sleep
@@ -563,12 +567,19 @@ immediately.
 
 /--
 Waits for the task to finish, then returns its result.
+
+On a cooperative task manager (no worker threads), this runs queued tasks and panics if nothing
+queued can finish the task; see `Task.get`.
 -/
 @[extern "lean_io_wait"] opaque wait (t : Task α) : BaseIO α :=
   return t.get
 
 /--
 Waits until any of the tasks in the list has finished, then returns its result.
+
+On a cooperative task manager (no worker threads), this runs a queued task of the list first, then
+queued tasks highest priority first, and panics if nothing queued can finish any of them; see
+`Task.get`.
 -/
 @[extern "lean_io_wait_any"] opaque waitAny (tasks : @& List (Task α))
     (h : tasks.length > 0 := by exact Nat.zero_lt_succ _) : BaseIO α :=

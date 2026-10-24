@@ -21,6 +21,18 @@ inline lean_obj_res io_result_mk_uv_error(int errnum) { return io_result_mk_erro
 inline lean_obj_res io_result_mk_enomem() { return io_result_mk_error(decode_io_error(ENOMEM, nullptr)); }
 LEAN_EXPORT lean_obj_res mk_embedded_nul_error(b_lean_obj_arg str);
 LEAN_EXPORT lean_obj_res io_wrap_handle(FILE * hfile);
+/* Makes the current thread's standard streams the process's for its scope, and restores the thread's
+   afterwards: for a task the cooperative task manager runs on a waiting thread's stack, which must not
+   inherit that thread's redirections (`IO.setStdout`, `IO.FS.withIsolatedStreams`), as a task on a worker
+   thread would not. */
+class LEAN_EXPORT scoped_default_streams {
+    lean_object * m_stdin;
+    lean_object * m_stdout;
+    lean_object * m_stderr;
+public:
+    scoped_default_streams();
+    ~scoped_default_streams();
+};
 void initialize_io();
 void finalize_io();
 }

@@ -1,0 +1,2 @@
+waiting
+INTERNAL PANIC: `Task.get` on a task that cannot finish: the task manager has no worker threads and no queued task resolves it; it waits for an `IO.Promise` that would be resolved later, by code suspended below this wait

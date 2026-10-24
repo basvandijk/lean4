@@ -1,0 +1,136 @@
+== spawn-lazy
+after spawn
+state waiting
+spawned
+result: ok 1
+== spawn-nested
+after outer
+outer start
+inner state: waiting
+outer end
+done
+inner
+== map-pending
+setup done
+resolved
+state waiting
+continuation (some 5)
+result: ok 6
+== map-finished
+state waiting
+continuation on finished 1
+result: ok 2
+== sync-inline
+before resolve
+sync continuation (some 1)
+after resolve
+result: ok 1
+task: before resolve
+sync continuation (some 2)
+task: after resolve
+result: ok 2
+sync on finished 3
+result: ok 3
+end
+== bind-pending-pq
+setup done
+p continuation (some 1)
+q continuation (some 2)
+result: ok 3
+== bind-pending-qp
+setup done
+p continuation (some 1)
+q continuation (some 2)
+result: ok 3
+== async-do
+segment 0
+setup done
+segment 1: 1
+segment 2: 2
+segment 3: 3
+result: ok 6
+== loops
+setup done
+for: 1
+for: 2
+for: 3
+repeat: 0
+repeat: 1
+result: ok 6
+== try-catch
+setup done
+caught: failed after 1
+result: ok 0
+== race
+result: ok 1
+== concurrently
+setup done
+x before await
+y before await
+x after await 1
+y after await 2
+result: ok (1, 2)
+== drop-promise
+setup done
+state waiting
+continuation none
+result: ok 0
+== drop-promise-in-task
+task: dropped
+task: state waiting
+task done
+continuation none
+result: ok 0
+== reentrant
+setup done
+p continuation (some 3)
+after resolve q
+q continuation (some 7)
+done
+== consumer-first
+result: ok (some 1)
+== cancel
+canceled: true
+== cancel-propagates
+canceled: true
+== cancel-nested
+outer canceled before: true
+inner canceled: false
+outer canceled after: true
+== deep-10000
+deep 10000: (some 10000)
+== deep-100000
+deep 100000: (some 100000)
+== priorities
+setup done
+dedicated priority
+max priority
+default priority
+done
+== directed
+default priority
+after wait
+max priority
+== drop-queued
+pure task state waiting
+io task ran
+after yield
+== heartbeats-nested
+100000 100000 100000 before true across true after true task true
+== streams-nested
+from task
+buffer: captured
+== states
+promised: running
+queued: waiting
+running: running
+finished: finished
+== wait-any
+first: ok 7
+result: ok 9
+== sleep-yield
+ran during sleep
+after sleep
+== exit-drains
+main done
+ran at exit

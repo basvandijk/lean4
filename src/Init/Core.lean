@@ -619,6 +619,11 @@ It represents a computation that will resolve to a value of type `α`,
 possibly being computed on another thread. This is similar to `Future` in Scala,
 `Promise` in Javascript, and `JoinHandle` in Rust.
 
+On a runtime with no worker threads (`lean -j0`, `LEAN_NUM_THREADS=0`, or a runtime built without
+threads), the task manager is *cooperative*: a task that is spawned or readied is queued, and queued
+tasks run on the calling thread when it waits for a task (`Task.get`, `IO.wait`, `IO.waitAny`), sleeps
+(`IO.sleep`), or exits. Every schedule it produces is one that the threaded task manager could produce.
+
 The tasks have an overridden representation in the runtime.
 -/
 structure Task (α : Type u) : Type u where
@@ -637,6 +642,10 @@ structure Task (α : Type u) : Type u where
   particular, calling `Task.get` in a task continuation with `(sync := true)` will panic as the
   continuation is decidedly not "cheap" in this case and deadlocks may otherwise occur. The
   waited-upon task should instead be returned and unwrapped using `Task.bind/IO.bindTask`.
+
+  On a cooperative task manager (no worker threads, see `Task`), `get` runs the awaited task if it is
+  queued, then queued tasks highest priority first, until the task finishes. It panics if nothing queued
+  can finish the task, such as an `IO.Promise` that code waiting here would resolve afterwards.
   -/
   get : α
   deriving Inhabited, Nonempty
@@ -671,6 +680,9 @@ Any priority higher than `Task.Priority.max` will result in the task being sched
 immediately on a dedicated thread. This is particularly useful for long-running and/or
 I/O-bound tasks since Lean will, by default, allocate no more non-dedicated workers
 than the number of cores to reduce context switches.
+
+A cooperative task manager (no worker threads, see `Task`) has no dedicated threads and treats it as
+`Task.Priority.max`.
 -/
 def Priority.dedicated : Priority := 9
 

@@ -9,6 +9,7 @@ Author: Leonardo de Moura
 #include <algorithm>
 #include <vector>
 #include <deque>
+#include <optional>
 #include <cmath>
 #include <lean/lean.h>
 #include "runtime/object.h"
@@ -555,6 +556,12 @@ extern "C" LEAN_EXPORT b_obj_res lean_thunk_get_core(b_obj_arg t) {
         return r;
     } else {
         lean_assert(c == nullptr);
+#if !defined(LEAN_MULTI_THREAD)
+        // With one thread, no value means this thread re-entered the evaluation, e.g. through a task run
+        // at a wait inside it, and waiting would spin forever.
+        if (!lean_to_thunk(t)->m_value)
+            lean_internal_panic("thunk forced while its own evaluation is in progress");
+#endif
         /* There is another thread executing the closure. We keep waiting for the m_value to be
            set by another thread. */
         while (!lean_to_thunk(t)->m_value) {
@@ -662,6 +669,8 @@ static obj_res mark_mt_fn(obj_arg o) {
 
 extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
 #ifndef LEAN_MULTI_THREAD
+    // Without threads no object is ever shared between threads, so every count stays single-threaded and
+    // the traversal is skipped; the cooperative task manager runs tasks on the one thread.
     return;
 #endif
     if (lean_is_scalar(o) || !is_unshared(o)) return;
@@ -742,6 +751,7 @@ static lean_task_imp * alloc_task_imp(obj_arg c, unsigned prio, bool keep_alive)
     imp->m_canceled    = false;
     imp->m_keep_alive  = keep_alive;
     imp->m_deleted     = false;
+    imp->m_orphaned    = false;
     return imp;
 }
 
@@ -759,6 +769,87 @@ struct scoped_current_task_object : flet<lean_task_object *> {
     scoped_current_task_object(lean_task_object * t):flet(g_current_task_object, t) {}
 };
 
+// While `task_manager::discard` frees closures on this thread, the dependents of a promise they drop go here,
+// to be discarded as well.
+LEAN_THREAD_PTR(buffer<lean_task_object *>, g_discard_todo);
+
+// Whether a `(sync := true)` task is running on this thread, inline in whatever readied it.
+static bool current_task_is_sync() {
+    return g_current_task_object &&
+        g_current_task_object->m_imp.load(std::memory_order_relaxed)->m_prio == LEAN_SYNC_PRIO;
+}
+
+// A task run in cooperative mode (see `task_manager::m_cooperative`) runs on the stack of the thread that
+// waits for it, where a worker thread would have started with fresh thread-local state. Gives the task a
+// fresh thread's state and restores the waiter's afterwards: the two heartbeat counters, so that the task
+// is not charged to the waiter's `maxHeartbeats` budget (as `lean_thunk_get_core` does for shared thunks),
+// the kernel's recursion depth and cancel token, and the redirected standard streams.
+struct scoped_fresh_task_context {
+    uint64_t               m_alloc_heartbeats;
+    size_t                 m_kernel_heartbeat;
+    scope_max_heartbeat    m_max_heartbeat; // keeps the waiter's limit, as `lthread` passes it on
+    scope_max_rec_depth    m_rec_depth;
+    scope_cancel_tk        m_cancel_tk;
+    scoped_default_streams m_streams;
+    scoped_fresh_task_context():
+        m_alloc_heartbeats(get_num_heartbeats()), m_kernel_heartbeat(get_heartbeat()),
+        m_max_heartbeat(get_max_heartbeat()), m_rec_depth(0), m_cancel_tk(nullptr) {
+    }
+    ~scoped_fresh_task_context() {
+        set_heartbeat(m_kernel_heartbeat);
+        set_heartbeats(m_alloc_heartbeats);
+    }
+};
+
+// Cooperative mode: a C++ exception escaping a task's closure would unwind into the frames of the thread
+// that waits for the task; on a worker thread it ends the process, so it is fatal here too.
+static object * apply_task_closure(object * c) {
+    try {
+        return lean_apply_1(c, box(0));
+    } catch (throwable & ex) {
+        lean_internal_panic((std::string("unhandled exception in task: ") + ex.what()).c_str());
+    } catch (interrupted &) {
+        lean_internal_panic("unhandled interrupt in task");
+    } catch (std::exception & ex) {
+        lean_internal_panic((std::string("unhandled exception in task: ") + ex.what()).c_str());
+    } catch (...) {
+        lean_internal_panic("unhandled exception in task");
+    }
+}
+
+// The first finished task of `task_list`, if any.
+static object * wait_any_check(object * task_list) {
+    object * it = task_list;
+    while (!is_scalar(it)) {
+        object * head = lean_ctor_get(it, 0);
+        if (lean_to_task(head)->m_value)
+            return head;
+        it = cnstr_get(it, 1);
+    }
+    return nullptr;
+}
+
+static char const * g_task_get_cannot_finish_msg =
+    "`Task.get` on a task that cannot finish: the task manager has no worker threads and no queued task "
+    "resolves it; it waits for an `IO.Promise` that would be resolved later, by code suspended below this wait";
+static char const * g_wait_any_cannot_finish_msg =
+    "`IO.waitAny` on tasks that cannot finish: the task manager has no worker threads and no queued task "
+    "resolves them; they wait for an `IO.Promise` that would be resolved later, by code suspended below this wait";
+
+/* The task manager runs the tasks of `Task` and `IO.Promise`.
+
+   With worker threads (the default), queued tasks are run by a pool of threads, dedicated tasks by a thread
+   each, and a wait blocks the waiting thread.
+
+   In cooperative mode (0 workers: `-j0`, `LEAN_NUM_THREADS=0`, `lean_init_task_manager_using(0)`, an
+   unknown hardware concurrency, and always without `LEAN_MULTI_THREAD`) there are no worker threads: the
+   manager behaves like the threaded one with one worker that only runs when the calling thread would
+   otherwise block (`wait_for`, `wait_any`), sleep (`lean_dbg_sleep`), finalize (the destructor), or asks
+   (`lean_run_pending_tasks`). Creating, readying or dropping a task never runs one (except `sync := true`
+   continuations, as in every mode); a wait first runs the awaited task if it is queued, then queued tasks in
+   `dequeue` order; and a wait that nothing queued or outside the manager can finish is a fatal panic, since
+   on one stack the value could only come from code suspended below the wait. Every trace is a schedule the
+   threaded manager could produce. */
 class task_manager {
     mutex                                         m_mutex;
     std::vector<std::unique_ptr<lthread>>         m_std_workers;
@@ -772,6 +863,8 @@ class task_manager {
     condition_variable                            m_task_finished_cv;
     condition_variable                            m_dedicated_finished_cv;
     bool                                          m_shutting_down{false};
+    // Cooperative mode, see the class comment. Selected by a worker count of 0.
+    bool                                          m_cooperative{false};
 
     lean_task_object * dequeue() {
         lean_assert(m_queues_size != 0);
@@ -798,18 +891,93 @@ class task_manager {
             run_task(lock, t);
             return;
         }
+        if (m_cooperative) {
+            // No thread for a dedicated task: it is the first regular task to run. A thread waiting in
+            // `wait_cooperative` must wake to run what another thread queued.
+            push_queued(std::min(prio, (unsigned)LEAN_MAX_PRIO), t);
+            m_task_finished_cv.notify_all();
+            return;
+        }
         if (prio > LEAN_MAX_PRIO) {
             spawn_dedicated_worker(t);
             return;
         }
-        if (prio > m_max_prio)
-            m_max_prio = prio;
-        m_queues[prio].push_back(t);
-        m_queues_size++;
+        push_queued(prio, t);
         if (!m_idle_std_workers && m_std_workers.size() < m_max_std_workers)
             spawn_worker();
         else
             m_queue_cv.notify_one();
+    }
+
+    void push_queued(unsigned prio, lean_task_object * t) {
+        if (prio > m_max_prio)
+            m_max_prio = prio;
+        m_queues[prio].push_back(t);
+        m_queues_size++;
+    }
+
+    // Cooperative mode: runs queued tasks on this thread, in `dequeue` order, until `done()` holds or the
+    // queue is empty; whether `done()` holds. A task that waits nests a call of this, so the stack grows
+    // with nested waits, not with the length of a chain of continuations, which `resolve_core` only queues.
+    template<class Done> bool run_queued(unique_lock<mutex> & lock, Done const & done) {
+        while (!done()) {
+            if (m_queues_size == 0)
+                return false;
+            run_task(lock, dequeue());
+        }
+        return true;
+    }
+
+    // Cooperative mode: if `t` is queued, removes it from its queue and runs it; whether it was. A wait runs
+    // the awaited task itself first, so that work the waiter does not depend on stays off its stack, where
+    // it could need a lock the waiter holds.
+    bool run_if_queued(unique_lock<mutex> & lock, lean_task_object * t) {
+        lean_task_imp * imp = t->m_imp.load(std::memory_order_relaxed);
+        if (!imp || !imp->m_closure || imp->m_prio == LEAN_SYNC_PRIO)
+            return false;
+        unsigned prio = std::min(imp->m_prio, (unsigned)LEAN_MAX_PRIO);
+        std::deque<lean_task_object *> & q = m_queues[prio];
+        auto it = std::find(q.begin(), q.end(), t);
+        if (it == q.end())
+            return false; // waiting for a dependency
+        q.erase(it);
+        m_queues_size--;
+        while (m_max_prio > 0 && m_queues[m_max_prio].empty())
+            --m_max_prio;
+        run_task(lock, t);
+        return true;
+    }
+
+    // With worker threads only: whether something outside the manager, the libuv loop thread, may still
+    // resolve a task. The hook takes the loop's lock, under which the loop thread resolves tasks, so it is
+    // called with ours released.
+    bool external_producer_possible(unique_lock<mutex> & lock) {
+#if defined(LEAN_MULTI_THREAD)
+        if (!g_lean_task_manager_idle_hook)
+            return false;
+        lock.unlock();
+        bool possible = g_lean_task_manager_idle_hook();
+        lock.lock();
+        return possible;
+#else
+        (void)lock;
+        return false;
+#endif
+    }
+
+    // Cooperative mode: runs queued tasks until `done()` holds. Once the queue is empty only another thread
+    // could make it hold: waits for one if there can be one, and otherwise panics with `msg`, since on one
+    // stack the value could only come from code suspended below this wait.
+    template<class Done> void wait_cooperative(unique_lock<mutex> & lock, Done const & done, char const * msg) {
+        while (!run_queued(lock, done)) {
+            bool possible = external_producer_possible(lock);
+            if (done() || m_queues_size > 0)
+                continue; // changed while the lock was released
+            if (!possible)
+                lean_internal_panic(msg);
+            // Timed, so that a loop that ends without resolving anything is noticed at the next check.
+            m_task_finished_cv.wait_for(lock, chrono::milliseconds(100));
+        }
     }
 
     void deactivate_task_core(unique_lock<mutex> & lock, lean_task_object * t) {
@@ -893,6 +1061,11 @@ class task_manager {
             free_task(t);
             return;
         }
+        // Before `reset_heartbeat`, so that it saves the waiter's count. Not for a `sync` task, which runs
+        // in the context of the thread that readies it, as it does with threads.
+        std::optional<scoped_fresh_task_context> fresh;
+        if (m_cooperative && imp->m_prio != LEAN_SYNC_PRIO)
+            fresh.emplace();
         reset_heartbeat();
         object * v = nullptr;
         {
@@ -900,7 +1073,7 @@ class task_manager {
             object * c = imp->m_closure;
             imp->m_closure = nullptr;
             lock.unlock();
-            v = lean_apply_1(c, box(0));
+            v = m_cooperative ? apply_task_closure(c) : lean_apply_1(c, box(0));
             // If deactivation was delayed by `m_keep_alive`, deactivate after the final execution (`v != nulltpr`)
             if (v != nullptr && imp->m_keep_alive) {
                 lean_dec_ref((lean_object*)t);
@@ -924,6 +1097,12 @@ class task_manager {
             object * c = imp->m_closure;
             lock.unlock();
             add_dep(lean_to_task(closure_arg_cptr(c)[0]), t);
+            lock.lock();
+        }
+        if (fresh) {
+            // Restoring the streams releases those the task installed, which may free anything.
+            lock.unlock();
+            fresh.reset();
             lock.lock();
         }
     }
@@ -957,23 +1136,20 @@ class task_manager {
         }
     }
 
-    object * wait_any_check(object * task_list) {
-        object * it = task_list;
-        while (!is_scalar(it)) {
-            object * head = lean_ctor_get(it, 0);
-            if (lean_to_task(head)->m_value)
-                return head;
-            it = cnstr_get(it, 1);
-        }
-        return nullptr;
-    }
-
 public:
     task_manager(unsigned max_std_workers):
-        m_max_std_workers(max_std_workers) {
+        m_max_std_workers(max_std_workers), m_cooperative(max_std_workers == 0) {
     }
 
     ~task_manager() {
+        if (m_cooperative) {
+            // Runs what is still queued here, as the workers do before they exit; the tasks see
+            // `IO.checkCanceled` as true (see `lean_io_check_canceled_core`).
+            unique_lock<mutex> lock(m_mutex);
+            m_shutting_down = true;
+            run_queued(lock, [] { return false; });
+            return;
+        }
         {
             unique_lock<mutex> lock(m_mutex);
             m_shutting_down = true;
@@ -1037,6 +1213,11 @@ public:
         if (g_current_task_object && g_current_task_object->m_imp.load(std::memory_order_relaxed)->m_prio == LEAN_SYNC_PRIO) {
             lean_panic("`Task.get` called from a `(sync := true)` task");
         }
+        if (m_cooperative) {
+            run_if_queued(lock, t);
+            wait_cooperative(lock, [&] { return t->m_value != nullptr; }, g_task_get_cannot_finish_msg);
+            return;
+        }
         if (in_pool) {
             m_max_std_workers++;
             if (m_idle_std_workers == 0)
@@ -1054,6 +1235,14 @@ public:
         if (object * t = wait_any_check(task_list))
             return t;
         unique_lock<mutex> lock(m_mutex);
+        if (m_cooperative) {
+            for (object * it = task_list; !is_scalar(it); it = cnstr_get(it, 1)) {
+                if (run_if_queued(lock, lean_to_task(lean_ctor_get(it, 0))))
+                    break;
+            }
+            wait_cooperative(lock, [&] { return wait_any_check(task_list) != nullptr; }, g_wait_any_cannot_finish_msg);
+            return wait_any_check(task_list);
+        }
         while (true) {
             if (object * t = wait_any_check(task_list))
                 return t;
@@ -1069,10 +1258,118 @@ public:
             lean_dec(v);
             free_task(t);
             return;
-        } else {
-            lean_assert(t->m_imp.load(std::memory_order_relaxed));
-            deactivate_task_core(lock, t);
         }
+        lean_task_imp * imp = t->m_imp.load(std::memory_order_relaxed);
+        lean_assert(imp);
+        if (imp->m_orphaned) {
+            // Nothing but its handles referred to it (see `discard`); a dependent registered since has been
+            // deactivated, as it held a reference.
+            lean_task_object * it = imp->m_head_dep;
+            imp->m_head_dep = nullptr;
+            lock.unlock();
+            while (it) {
+                lean_task_imp * it_imp = it->m_imp.load(std::memory_order_relaxed);
+                lean_assert(it_imp->m_deleted);
+                lean_task_object * next_it = it_imp->m_next_dep;
+                free_task(it);
+                it = next_it;
+            }
+            free_task(t);
+            return;
+        }
+        deactivate_task_core(lock, t);
+    }
+
+    // Finishes `t` with `v` without running its dependents, which it detaches into `todo` (see `discard`).
+    void discard_core(unique_lock<mutex> & lock, lean_task_object * t, object * v, buffer<lean_task_object *> & todo) {
+        (void)lock;
+        mark_mt(v);
+        t->m_value = v;
+        lean_task_imp * imp = t->m_imp.exchange(nullptr, std::memory_order_relaxed);
+        lean_task_object * it = imp->m_head_dep;
+        imp->m_head_dep = nullptr;
+        while (it) {
+            lean_task_imp * it_imp = it->m_imp.load(std::memory_order_relaxed);
+            lean_task_object * next_it = it_imp->m_next_dep;
+            it_imp->m_next_dep = nullptr;
+            todo.push_back(it);
+            it = next_it;
+        }
+        free_task_imp(imp);
+        m_task_finished_cv.notify_all();
+    }
+
+    // Resolves `t`, a promise's task, with `v`, and frees the tasks that wait for it, and those that wait for
+    // them, without running any (see `lean_io_promise_discard`): their closures, the reference that keeps a
+    // task alive for its effects, and the deactivated ones among them; one that is still referenced is
+    // orphaned. A promise dropped by freeing a closure is discarded the same way (`resolve_dropped`). A
+    // worklist, so that a chain of any length is freed on a flat stack. Closures are freed with the lock
+    // released, as in `deactivate_task_core`: freeing them re-enters the manager.
+    void discard(lean_task_object * t, object * v) {
+        buffer<lean_task_object *> todo;
+        {
+            unique_lock<mutex> lock(m_mutex);
+            if (t->m_value) {
+                lock.unlock();
+                dec(v);
+                return;
+            }
+            discard_core(lock, t, v, todo);
+        }
+        flet<buffer<lean_task_object *> *> scope(g_discard_todo, &todo);
+        while (!todo.empty()) {
+            lean_task_object * d = todo.back();
+            todo.pop_back();
+            object * c = nullptr;
+            bool keep_alive = false;
+            bool deleted;
+            {
+                unique_lock<mutex> lock(m_mutex);
+                lean_task_imp * imp = d->m_imp.load(std::memory_order_relaxed);
+                deleted = imp->m_deleted;
+                if (!deleted) {
+                    c = imp->m_closure;
+                    imp->m_closure = nullptr;
+                    keep_alive = imp->m_keep_alive;
+                    imp->m_keep_alive = false;
+                    imp->m_canceled.store(true, std::memory_order_relaxed);
+                    imp->m_orphaned = true;
+                    lean_task_object * it = imp->m_head_dep;
+                    imp->m_head_dep = nullptr;
+                    while (it) {
+                        lean_task_imp * it_imp = it->m_imp.load(std::memory_order_relaxed);
+                        lean_task_object * next_it = it_imp->m_next_dep;
+                        it_imp->m_next_dep = nullptr;
+                        todo.push_back(it);
+                        it = next_it;
+                    }
+                }
+            }
+            if (deleted) {
+                // Deactivated while waiting: the list it was in owned it (see `deactivate_task_core`).
+                free_task(d);
+            } else {
+                if (c)
+                    dec_ref(c);
+                if (keep_alive)
+                    lean_dec_ref((lean_object *)d);
+            }
+        }
+    }
+
+    // `resolve` for a dropped promise: during a `discard` on this thread, its dependents are discarded too.
+    void resolve_dropped(lean_task_object * t, object * v) {
+        if (!g_discard_todo) {
+            resolve(t, v);
+            return;
+        }
+        unique_lock<mutex> lock(m_mutex);
+        if (t->m_value) {
+            lock.unlock();
+            dec(v);
+            return;
+        }
+        discard_core(lock, t, v, *g_discard_todo);
     }
 
     void cancel(lean_task_object * t) {
@@ -1099,17 +1396,56 @@ public:
             return 2; // finished
         }
     }
+
+    bool cooperative() const {
+        return m_cooperative;
+    }
+
+    // Cooperative mode: runs the queued tasks until none is left; whether any ran.
+    bool run_pending() {
+        if (!m_cooperative)
+            return false;
+        unique_lock<mutex> lock(m_mutex);
+        bool ran = m_queues_size > 0;
+        run_queued(lock, [] { return false; });
+        return ran;
+    }
 };
 
 static task_manager * g_task_manager = nullptr;
 
+LEAN_EXPORT bool (*g_lean_task_manager_idle_hook)() = nullptr;
+
+bool task_manager_is_cooperative() {
+    return g_task_manager && g_task_manager->cooperative();
+}
+
+bool task_manager_run_pending() {
+    return g_task_manager && g_task_manager->run_pending();
+}
+
+extern "C" LEAN_EXPORT void lean_run_pending_tasks() {
+    if (g_task_manager)
+        g_task_manager->run_pending();
+}
+
+static void delete_task_manager() {
+    if (g_task_manager->cooperative()) {
+        // The tasks still queued run inside the destructor, on this thread; give them the stack a worker
+        // thread would have had.
+        run_with_thread_stack([] { delete g_task_manager; });
+    } else {
+        delete g_task_manager;
+    }
+    g_task_manager = nullptr;
+}
+
 extern "C" LEAN_EXPORT void lean_init_task_manager_using(unsigned num_workers) {
     lean_assert(g_task_manager == nullptr);
-#if defined(LEAN_MULTI_THREAD)
-    if (num_workers > 0) {
-        g_task_manager = new task_manager(num_workers);
-    }
+#if !defined(LEAN_MULTI_THREAD)
+    num_workers = 0; // no threads: cooperative mode, see `task_manager`
 #endif
+    g_task_manager = new task_manager(num_workers);
 }
 
 static unsigned get_lean_num_threads() {
@@ -1131,34 +1467,50 @@ extern "C" LEAN_EXPORT void lean_init_task_manager() {
 }
 
 extern "C" LEAN_EXPORT void lean_finalize_task_manager() {
-    if (g_task_manager) {
-        delete g_task_manager;
-        g_task_manager = nullptr;
-    }
+    if (g_task_manager)
+        delete_task_manager();
 }
 
 scoped_task_manager::scoped_task_manager(unsigned num_workers) {
-    lean_assert(g_task_manager == nullptr);
-#if defined(LEAN_MULTI_THREAD)
-    if (num_workers > 0) {
-        g_task_manager = new task_manager(num_workers);
-    }
-#endif
+    lean_init_task_manager_using(num_workers);
 }
 
 scoped_task_manager::~scoped_task_manager() {
-    if (g_task_manager) {
-        delete g_task_manager;
-        g_task_manager = nullptr;
-    }
+    lean_finalize_task_manager();
 }
 
 void deactivate_task(lean_task_object * t) {
     if (g_task_manager) {
         g_task_manager->deactivate_task(t);
+        return;
+    }
+    // No manager: before it exists every task is finished (`Task.spawn` evaluates eagerly); after
+    // `lean_finalize_task_manager`, whose drain left nothing queued, an unfinished task is a promise's or
+    // waits for one, and nothing will resolve it. As `deactivate_task_core`, without the lock.
+    if (object * v = t->m_value) {
+        lean_dec(v);
+        free_task(t);
+        return;
+    }
+    lean_task_imp * imp = t->m_imp.load(std::memory_order_relaxed);
+    object * c = imp->m_closure;
+    lean_task_object * it = imp->m_head_dep;
+    imp->m_closure  = nullptr;
+    imp->m_head_dep = nullptr;
+    imp->m_deleted  = true;
+    imp->m_canceled.store(true, std::memory_order_relaxed);
+    while (it) {
+        lean_task_imp * it_imp = it->m_imp.load(std::memory_order_relaxed);
+        lean_assert(it_imp->m_deleted);
+        lean_task_object * next_it = it_imp->m_next_dep;
+        free_task(it);
+        it = next_it;
+    }
+    if (c) {
+        // A task with a closure waits for a dependency, whose dependent list refers to `t`: the dependency
+        // frees `t` when it is deactivated, possibly right here, as the closure holds the reference to it.
+        lean_dec(c);
     } else {
-        lean_assert(t->m_value != nullptr);
-        lean_dec(t->m_value);
         free_task(t);
     }
 }
@@ -1230,6 +1582,8 @@ LEAN_EXPORT void (*g_lean_report_task_get_blocked_time)(std::chrono::nanoseconds
 extern "C" LEAN_EXPORT b_obj_res lean_task_get(b_obj_arg t) {
     if (object * v = lean_to_task(t)->m_value)
         return v;
+    if (!g_task_manager)
+        lean_internal_panic("`Task.get` on a task that has not finished, before the task manager is running (in an `initialize` block?)");
     if (g_lean_report_task_get_blocked_time) {
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
         g_task_manager->wait_for(lean_to_task(t));
@@ -1295,19 +1649,27 @@ extern "C" LEAN_EXPORT bool lean_io_check_canceled_core() {
 }
 
 extern "C" LEAN_EXPORT void lean_io_cancel_core(b_obj_arg t) {
-    if (lean_to_task(t)->m_value)
+    if (lean_to_task(t)->m_value || !g_task_manager)
         return;
     g_task_manager->cancel(lean_to_task(t));
 }
 
 extern "C" LEAN_EXPORT uint8_t lean_io_get_task_state_core(b_obj_arg t) {
     lean_task_object * o = lean_to_task(t);
-    if (!o->m_imp.load(std::memory_order::relaxed))
+    lean_task_imp * imp = o->m_imp.load(std::memory_order::relaxed);
+    if (!imp)
         return 2; // finished
+    if (!g_task_manager)
+        return imp->m_closure ? 0 : 1; // see `task_manager::get_task_state`
     return g_task_manager->get_task_state(o);
 }
 
 extern "C" LEAN_EXPORT b_obj_res lean_io_wait_any_core(b_obj_arg task_list) {
+    if (!g_task_manager) {
+        if (object * t = wait_any_check(task_list))
+            return t;
+        lean_internal_panic("`IO.waitAny` on tasks that have not finished, before the task manager is running (in an `initialize` block?)");
+    }
     return g_task_manager->wait_any(task_list);
 }
 
@@ -1335,6 +1697,11 @@ obj_res lean_promise_new() {
 }
 
 void lean_promise_resolve(obj_arg value, b_obj_arg promise) {
+    if (!g_task_manager) {
+        // After `lean_finalize_task_manager`, e.g. from a libuv callback: nothing can wait for it any more.
+        lean_dec(value);
+        return;
+    }
     g_task_manager->resolve(lean_to_promise(promise)->m_result, mk_option_some(value));
 }
 
@@ -1355,9 +1722,17 @@ extern "C" LEAN_EXPORT obj_res lean_io_promise_result_opt(b_obj_arg promise) {
 }
 
 void deactivate_promise(lean_promise_object * promise) {
-    g_task_manager->resolve(promise->m_result, mk_option_none());
+    // After `lean_finalize_task_manager` nothing can wait for the result any more.
+    if (g_task_manager)
+        g_task_manager->resolve_dropped(promise->m_result, mk_option_none());
     lean_dec_ref((lean_object *)promise->m_result);
     lean_free_small_object((lean_object *)promise);
+}
+
+extern "C" LEAN_EXPORT obj_res lean_io_promise_discard(b_obj_arg promise) {
+    if (g_task_manager)
+        g_task_manager->discard(lean_to_promise(promise)->m_result, mk_option_none());
+    return box(0);
 }
 
 // =======================================
@@ -2879,6 +3254,11 @@ extern "C" LEAN_EXPORT object * lean_dbg_trace(obj_arg s, obj_arg fn) {
 }
 
 extern "C" LEAN_EXPORT object * lean_dbg_sleep(uint32 ms, obj_arg fn) {
+    // In cooperative mode a sleep is a point at which queued tasks run, so that a loop that polls
+    // `IO.getTaskState` between sleeps makes progress. Not inside a `sync` task, which may be running on
+    // the libuv loop thread, inside a callback.
+    if (g_task_manager && g_task_manager->cooperative() && !current_task_is_sync())
+        g_task_manager->run_pending();
     chrono::milliseconds c(ms);
     this_thread::sleep_for(c);
     return lean_apply_1(fn, lean_box(0));
@@ -2924,6 +3304,13 @@ void finalize_object() {
 }
 
 void lock_simple_atomic(std::atomic<int>& lock) {
+#if !defined(LEAN_MULTI_THREAD)
+    // With one thread a taken lock means this thread re-entered the initialization, e.g. through a task
+    // run at a wait inside it, and waiting would spin forever.
+    int should = 0;
+    if (!lock.compare_exchange_strong(should, 1))
+        lean_internal_panic("re-entrant initialization of a closed term");
+#else
     while (true) {
         lock.wait(1);
         int should = 0;
@@ -2931,6 +3318,7 @@ void lock_simple_atomic(std::atomic<int>& lock) {
             break;
         }
     }
+#endif
 }
 
 void unlock_simple_atomic(std::atomic<int>& lock) {

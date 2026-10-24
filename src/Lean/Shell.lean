@@ -154,6 +154,8 @@ def displayHelp (useStderr : Bool) : IO Unit := do
   out.putStrLn    "                         this is a deterministic way of interrupting long running tasks"
   if Internal.isMultiThread () then
     out.putStrLn  "  -j, --threads=num      number of threads used to process lean files"
+    out.putStrLn  "                         (0: tasks run on the main thread when it waits, and"
+    out.putStrLn  "                         elaboration is not asynchronous)"
     out.putStrLn  "  -s, --tstack=num       thread stack size in Kb"
     out.putStrLn  "      --server           start lean in server mode"
     out.putStrLn  "      --worker           start lean in server-worker mode"
@@ -458,6 +460,11 @@ where
 @[export lean_shell_main]
 def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
   let opts := { opts with leanOpts := opts.leanOpts.mergeBy (fun _ _ v => v) (Internal.getOptionOverrides ()) }
+  -- Without worker threads, a proof task waiting for one that is suspended below it on the one stack
+  -- could never finish (see `Task`); elaborate synchronously instead.
+  let opts := if opts.numThreads == 0 then
+    { opts with leanOpts := Elab.async.setIfNotSet opts.leanOpts false }
+  else opts
   if opts.printPrefix then
     IO.println (← getBuildDir)
     return 0

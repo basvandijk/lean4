@@ -29,7 +29,12 @@ void event_loop::start() {
     check_uv(uv_async_init(m_loop, &m_async, nullptr), "Failed to initialize async");
     m_waiters = 0;
 
+#if defined(LEAN_MULTI_THREAD)
     lthread([this]() { run(); });
+#else
+    // No thread to run the loop on (`lthread` would run it here, forever): libuv-based operations never
+    // complete, and a cooperative wait for one panics.
+#endif
 }
 
 void event_loop::lock() {

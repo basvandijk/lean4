@@ -29,6 +29,10 @@ void inc_heartbeat() { g_heartbeat++; }
 
 void reset_heartbeat() { g_heartbeat = 0; }
 
+size_t get_heartbeat() { return g_heartbeat; }
+
+void set_heartbeat(size_t count) { g_heartbeat = count; }
+
 void set_max_heartbeat(size_t max) { g_max_heartbeat = max; }
 
 extern "C" LEAN_EXPORT obj_res lean_internal_set_max_heartbeat(usize max) {

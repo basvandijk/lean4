@@ -43,6 +43,7 @@ extern "C" LEAN_EXPORT void lean_finalize_thread() {
     run_thread_finalizers();
 }
 
+#if defined(LEAN_MULTI_THREAD)
 static void thread_main(void * p) {
     lean_initialize_thread();
     {
@@ -52,7 +53,6 @@ static void thread_main(void * p) {
     lean_finalize_thread();
 }
 
-#if defined(LEAN_MULTI_THREAD)
 size_t lthread::m_thread_stack_size = LEAN_DEFAULT_THREAD_STACK_SIZE;
 
 void lthread::set_thread_stack_size(size_t sz) {
