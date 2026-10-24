@@ -21,6 +21,11 @@ extern "C" void initialize_libuv() {
     initialize_libuv_udp_socket();
     initialize_libuv_signal();
     global_ev.start();
+#if defined(LEAN_MULTI_THREAD)
+    // The loop thread resolves tasks: a cooperative wait that has nothing left to run waits for it while
+    // the loop has work (see `task_manager::external_producer_possible`).
+    g_lean_task_manager_idle_hook = [] { return lean_uv_event_loop_alive() != 0; };
+#endif
 }
 
 extern "C" LEAN_EXPORT char ** lean_setup_args(int argc, char ** argv) {

@@ -155,6 +155,23 @@ extern "C" LEAN_EXPORT obj_res lean_get_set_stderr(obj_arg h) {
     return r;
 }
 
+static lean_object * set_default_stream(obj_res (*set)(obj_arg), lean_object * dflt) {
+    lean_inc(dflt);
+    return set(dflt);
+}
+
+scoped_default_streams::scoped_default_streams():
+    m_stdin(set_default_stream(lean_get_set_stdin, g_stream_stdin)),
+    m_stdout(set_default_stream(lean_get_set_stdout, g_stream_stdout)),
+    m_stderr(set_default_stream(lean_get_set_stderr, g_stream_stderr)) {
+}
+
+scoped_default_streams::~scoped_default_streams() {
+    lean_dec(lean_get_set_stdin(m_stdin));
+    lean_dec(lean_get_set_stdout(m_stdout));
+    lean_dec(lean_get_set_stderr(m_stderr));
+}
+
 static FILE * io_get_handle(lean_object * hfile) {
     return static_cast<FILE *>(lean_get_external_data(hfile));
 }
@@ -1471,10 +1488,19 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
                 (void)tmp;
                 return val;
             }
+#if !defined(LEAN_MULTI_THREAD)
+            // Taken while `ST.Ref.modify` runs: with one thread, the reader is code run inside it.
+            lean_internal_panic("null reference read");
+#endif
         }
     } else {
         object * val = lean_to_ref(ref)->m_value;
         lean_assert(val != nullptr);
+#if !defined(LEAN_MULTI_THREAD)
+        // The value is taken while `ST.Ref.modify` runs: with one thread, the reader is code run inside it.
+        if (val == nullptr)
+            lean_internal_panic("null reference read");
+#endif
         inc(val);
         return val;
     }
@@ -1487,10 +1513,17 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_take(b_obj_arg ref) {
             object * val = val_addr->exchange(nullptr);
             if (val != nullptr)
                 return val;
+#if !defined(LEAN_MULTI_THREAD)
+            lean_internal_panic("null reference read");
+#endif
         }
     } else {
         object * val = lean_to_ref(ref)->m_value;
         lean_assert(val != nullptr);
+#if !defined(LEAN_MULTI_THREAD)
+        if (val == nullptr)
+            lean_internal_panic("null reference read");
+#endif
         lean_to_ref(ref)->m_value = nullptr;
         return val;
     }
@@ -1526,6 +1559,10 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_swap(b_obj_arg ref, obj_arg a) {
             object * old_a = val_addr->load();
             if (old_a != nullptr && val_addr->compare_exchange_strong(old_a, a))
                 return old_a;
+#if !defined(LEAN_MULTI_THREAD)
+            if (old_a == nullptr)
+                lean_internal_panic("null reference read");
+#endif
         }
     } else {
         object * old_a = lean_to_ref(ref)->m_value;
@@ -1638,6 +1675,10 @@ extern "C" LEAN_EXPORT obj_res lean_option_get_or_block(obj_arg o_opt) {
     if (opt) {
         return opt.get_val().steal();
     } else {
+        if (task_manager_is_cooperative()) {
+            // No worker thread can resolve it, and a sleep would spin without threads.
+            lean_internal_panic("Promise.result!: promise has been dropped without ever being resolved");
+        }
         lean_panic("PANIC: Promise.result!: promise has been dropped without ever being resolved",
           /* force_stderr */ true);
         // this is only reachable when using non-fatal panics

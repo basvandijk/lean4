@@ -276,6 +276,14 @@ public:
     ~scoped_task_manager();
 };
 
+/* Cooperative mode of the task manager (no worker threads), see `task_manager` in object.cpp. */
+LEAN_EXPORT bool task_manager_is_cooperative();
+/* Runs the queued tasks of a cooperative task manager until none is left; whether any ran. */
+LEAN_EXPORT bool task_manager_run_pending();
+/* With worker threads only: whether something outside the task manager, the libuv loop, may still resolve
+   a task. A cooperative wait that has nothing left to run consults it, with no lock held, before panicking. */
+extern LEAN_EXPORT bool (*g_lean_task_manager_idle_hook)();
+
 inline obj_res task_spawn(obj_arg c, unsigned prio = 0, bool keep_alive = false) { return lean_task_spawn_core(c, prio, keep_alive); }
 inline obj_res task_pure(obj_arg a) { return lean_task_pure(a); }
 inline obj_res task_bind(obj_arg x, obj_arg f, unsigned prio = 0, bool sync = false, bool keep_alive = false) { return lean_task_bind_core(x, f, prio, sync, keep_alive); }

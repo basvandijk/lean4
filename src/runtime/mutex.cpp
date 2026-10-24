@@ -12,18 +12,92 @@ Authors: Gabriel Ebner, Henrik Böving
 
 namespace lean {
 
+#if defined(LEAN_MULTI_THREAD)
+typedef mutex              basemutex;
+typedef condition_variable condvar;
+typedef recursive_mutex    baserecmutex;
+typedef shared_mutex       basesharedmutex;
+#else
+// Without threads, `thread.h`'s mutexes and condition variables are no-ops: a lock would always succeed, so
+// `Mutex.tryAtomically` would report a held mutex as free, and a wait would return at once, so
+// `Condvar.waitUntil` would spin forever. These keep the one thread honest: locking what it holds is a
+// deadlock, and a wait runs the queued tasks of the cooperative task manager, the only code that could ever
+// notify.
+struct basemutex {
+    bool m_locked = false;
+    void lock() {
+        if (m_locked)
+            lean_internal_panic("deadlock: the mutex is held by this thread, and the runtime has no other");
+        m_locked = true;
+    }
+    bool try_lock() {
+        if (m_locked)
+            return false;
+        m_locked = true;
+        return true;
+    }
+    void unlock() { m_locked = false; }
+};
+struct condvar {
+    void wait(basemutex & m) {
+        m.unlock();
+        if (!task_manager_run_pending())
+            lean_internal_panic("`Condvar.wait`: nothing can notify the condition variable, the runtime has no "
+                                "other thread and no task is queued");
+        m.lock();
+    }
+    void notify_one() {}
+    void notify_all() {}
+};
+struct baserecmutex {
+    unsigned m_count = 0;
+    void lock() { m_count++; }
+    bool try_lock() { m_count++; return true; }
+    void unlock() { m_count--; }
+};
+struct basesharedmutex {
+    unsigned m_readers = 0;
+    bool     m_writer = false;
+    void lock() {
+        if (m_writer || m_readers > 0)
+            lean_internal_panic("deadlock: the shared mutex is held by this thread, and the runtime has no other");
+        m_writer = true;
+    }
+    bool try_lock() {
+        if (m_writer || m_readers > 0)
+            return false;
+        m_writer = true;
+        return true;
+    }
+    void unlock() { m_writer = false; }
+    void lock_shared() {
+        if (m_writer)
+            lean_internal_panic("deadlock: the shared mutex is held for writing by this thread, and the runtime "
+                                "has no other");
+        m_readers++;
+    }
+    bool try_lock_shared() {
+        if (m_writer)
+            return false;
+        m_readers++;
+        return true;
+    }
+    void unlock_shared() { m_readers--; }
+};
+#endif
+
 static lean_external_class * g_basemutex_external_class = nullptr;
 static void basemutex_finalizer(void * h) {
-    delete static_cast<mutex *>(h);
+    delete static_cast<basemutex *>(h);
 }
 static void basemutex_foreach(void *, b_obj_arg) {}
 
-static mutex * basemutex_get(lean_object * mtx) {
-    return static_cast<mutex *>(lean_get_external_data(mtx));
+static basemutex * basemutex_get(lean_object * mtx) {
+    return static_cast<basemutex *>(lean_get_external_data(mtx));
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_basemutex_new() {
-    return lean_alloc_external(g_basemutex_external_class, new mutex);
+    return lean_alloc_external(g_basemutex_external_class, new basemutex);
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_basemutex_lock(b_obj_arg mtx) {
@@ -43,47 +117,51 @@ extern "C" LEAN_EXPORT obj_res lean_io_basemutex_unlock(b_obj_arg mtx) {
 
 static lean_external_class * g_condvar_external_class = nullptr;
 static void condvar_finalizer(void * h) {
-    delete static_cast<condition_variable *>(h);
+    delete static_cast<condvar *>(h);
 }
 static void condvar_foreach(void *, b_obj_arg) {}
 
-static condition_variable * condvar_get(lean_object * mtx) {
-    return static_cast<condition_variable *>(lean_get_external_data(mtx));
+static condvar * condvar_get(lean_object * mtx) {
+    return static_cast<condvar *>(lean_get_external_data(mtx));
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_condvar_new() {
-    return lean_alloc_external(g_condvar_external_class, new condition_variable);
+    return lean_alloc_external(g_condvar_external_class, new condvar);
 }
 
-extern "C" LEAN_EXPORT obj_res lean_io_condvar_wait(b_obj_arg condvar, b_obj_arg mtx) {
-    unique_lock<mutex> lock(*basemutex_get(mtx), std::adopt_lock_t());
-    condvar_get(condvar)->wait(lock);
+extern "C" LEAN_EXPORT obj_res lean_io_condvar_wait(b_obj_arg cv, b_obj_arg mtx) {
+#if defined(LEAN_MULTI_THREAD)
+    unique_lock<basemutex> lock(*basemutex_get(mtx), std::adopt_lock_t());
+    condvar_get(cv)->wait(lock);
     lock.release();
+#else
+    condvar_get(cv)->wait(*basemutex_get(mtx));
+#endif
     return box(0);
 }
 
-extern "C" LEAN_EXPORT obj_res lean_io_condvar_notify_one(b_obj_arg condvar) {
-    condvar_get(condvar)->notify_one();
+extern "C" LEAN_EXPORT obj_res lean_io_condvar_notify_one(b_obj_arg cv) {
+    condvar_get(cv)->notify_one();
     return box(0);
 }
 
-extern "C" LEAN_EXPORT obj_res lean_io_condvar_notify_all(b_obj_arg condvar) {
-    condvar_get(condvar)->notify_all();
+extern "C" LEAN_EXPORT obj_res lean_io_condvar_notify_all(b_obj_arg cv) {
+    condvar_get(cv)->notify_all();
     return box(0);
 }
 
 static lean_external_class * g_baserecmutex_external_class = nullptr;
 static void baserecmutex_finalizer(void * h) {
-    delete static_cast<recursive_mutex *>(h);
+    delete static_cast<baserecmutex *>(h);
 }
 static void baserecmutex_foreach(void *, b_obj_arg) {}
 
-static recursive_mutex * baserecmutex_get(lean_object * mtx) {
-    return static_cast<recursive_mutex *>(lean_get_external_data(mtx));
+static baserecmutex * baserecmutex_get(lean_object * mtx) {
+    return static_cast<baserecmutex *>(lean_get_external_data(mtx));
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_baserecmutex_new() {
-    return lean_alloc_external(g_baserecmutex_external_class, new recursive_mutex);
+    return lean_alloc_external(g_baserecmutex_external_class, new baserecmutex);
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_baserecmutex_lock(b_obj_arg mtx) {
@@ -103,16 +181,16 @@ extern "C" LEAN_EXPORT obj_res lean_io_baserecmutex_unlock(b_obj_arg mtx) {
 
 static lean_external_class * g_basesharedmutex_external_class = nullptr;
 static void basesharedmutex_finalizer(void * h) {
-    delete static_cast<shared_mutex *>(h);
+    delete static_cast<basesharedmutex *>(h);
 }
 static void basesharedmutex_foreach(void *, b_obj_arg) {}
 
-static shared_mutex * basesharedmutex_get(lean_object * mtx) {
-    return static_cast<shared_mutex *>(lean_get_external_data(mtx));
+static basesharedmutex * basesharedmutex_get(lean_object * mtx) {
+    return static_cast<basesharedmutex *>(lean_get_external_data(mtx));
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_basesharedmutex_new() {
-    return lean_alloc_external(g_basesharedmutex_external_class, new shared_mutex);
+    return lean_alloc_external(g_basesharedmutex_external_class, new basesharedmutex);
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_basesharedmutex_write(b_obj_arg mtx) {

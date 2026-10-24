@@ -18,6 +18,11 @@ LEAN_EXPORT void inc_heartbeat();
 /** \brief Reset thread local counter for approximating elapsed time. */
 LEAN_EXPORT void reset_heartbeat();
 
+/** \brief The thread local counter, and setting it: the cooperative task manager saves and restores a
+    thread's counter around a task it runs on that thread's stack. */
+LEAN_EXPORT size_t get_heartbeat();
+LEAN_EXPORT void set_heartbeat(size_t count);
+
 /** \brief Threshold on the number of heartbeats. check_system will throw
     an exception if a thread exceeds the limit. The default is unlimited.
     The limit is checked in the check_system API.

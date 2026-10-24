@@ -276,6 +276,9 @@ typedef struct {
     // If true, task will not be freed until finished
     uint8_t              m_keep_alive;
     uint8_t              m_deleted;
+    // Set by `lean_io_promise_discard` on a task whose closure it freed without running it: the task never
+    // finishes, reports `running`, and is freed when its last reference is dropped.
+    uint8_t              m_orphaned;
 } lean_task_imp;
 
 /* Object of type `Task _`. The lifetime of a `lean_task` object can be represented as a state machine with atomic
@@ -328,7 +331,15 @@ typedef struct {
    * Finished
      * condition: m_value != nullptr
      * invariant: m_imp == nullptr
-     * transition: RC becomes 0 ==> freed (`deactivate_task` lock) */
+     * transition: RC becomes 0 ==> freed (`deactivate_task` lock)
+   * Orphaned (a Waiting or Promised task discarded by `lean_io_promise_discard`)
+     * condition: m_imp != nullptr && m_imp->m_orphaned
+     * invariant: m_imp->m_closure == nullptr && m_value == nullptr; it never finishes
+     * transition: RC becomes 0 ==> freed (`deactivate_task` lock)
+
+   In cooperative mode (no worker threads, see `lean_run_pending_tasks`) "dequeued by worker thread" means
+   dequeued by the thread at a wait, a sleep, finalization, or `lean_run_pending_tasks`; the states and
+   transitions are the same. */
 typedef struct lean_task {
     lean_object              m_header;
     _Atomic(lean_object *)   m_value;
@@ -1601,8 +1612,21 @@ static inline lean_obj_res lean_thunk_get_own(b_lean_obj_arg t) {
 /* Tasks */
 
 LEAN_EXPORT void lean_init_task_manager(void);
+/* `num_workers` worker threads; 0 selects cooperative mode, see `lean_run_pending_tasks`. */
 LEAN_EXPORT void lean_init_task_manager_using(unsigned num_workers);
 LEAN_EXPORT void lean_finalize_task_manager(void);
+/* Cooperative task manager (no worker threads: `lean_init_task_manager_using(0)`, `LEAN_NUM_THREADS=0`,
+   and every build without `LEAN_MULTI_THREAD`): runs the queued tasks on the calling thread until none is
+   left. Queued tasks otherwise run only when the thread waits (`lean_task_get`, `lean_io_wait_any_core`),
+   sleeps (`lean_dbg_sleep`), or finalizes the manager, so a host that resolves a promise from a callback
+   calls this before returning to the host, for the continuations to run then. A no-op with worker threads. */
+LEAN_EXPORT void lean_run_pending_tasks(void);
+/* Resolves the promise with `none` without running the tasks that wait for it: frees them, and the tasks that
+   wait for them, with their closures (so a promise that a closure captured is dropped, and discarded the same
+   way) and the reference that keeps a task created by `IO.asTask`/`mapTask`/`bindTask` alive for its effects;
+   a task that is still referenced otherwise is orphaned and never finishes. For a host whose callback must not
+   run Lean code, such as a cleanup after a trapped callback. Resolving the promise afterwards has no effect. */
+LEAN_EXPORT lean_obj_res lean_io_promise_discard(b_lean_obj_arg promise);
 
 LEAN_EXPORT lean_obj_res lean_task_spawn_core(lean_obj_arg c, unsigned prio, bool keep_alive);
 /* Run a closure `Unit -> A` as a `Task A` */
