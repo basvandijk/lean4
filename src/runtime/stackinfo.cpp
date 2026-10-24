@@ -15,6 +15,8 @@ Author: Leonardo de Moura
     // no extra included needed so far
 #elif defined(__APPLE__)
     #include <sys/resource.h> // NOLINT
+#elif defined(__wasi__)
+    // WASI has no resource limits, see `get_stack_size`
 #else
     #include <sys/time.h> // NOLINT
     #include <sys/resource.h> // NOLINT
@@ -57,6 +59,12 @@ size_t get_stack_size(bool main) {
     } else {
         return lthread::get_thread_stack_size();
     }
+}
+#elif defined(__wasi__)
+// There are no threads; the one stack is the region that wasm-ld reserves between these symbols.
+extern "C" char __stack_low, __stack_high;
+size_t get_stack_size(bool) {
+    return &__stack_high - &__stack_low;
 }
 #else
 size_t get_stack_size(bool main) {

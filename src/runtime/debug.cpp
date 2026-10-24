@@ -89,7 +89,7 @@ void invoke_debugger() {
         case 's':
             // force seg fault...
             debuggable_exit();
-#if !defined(LEAN_WINDOWS)
+#if !defined(LEAN_WINDOWS) && !defined(__wasi__) // WASI cannot start a debugger
         case 'G':
         case 'g': {
             std::cerr << "INVOKING GDB...\n";

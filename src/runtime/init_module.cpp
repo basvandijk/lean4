@@ -13,7 +13,10 @@ Author: Leonardo de Moura
 #include "runtime/process.h"
 #include "runtime/mutex.h"
 #include "runtime/init_module.h"
+// WASI has no libuv: the runtime files that use it are not built there (see wasi/stubs.cpp).
+#ifndef __wasi__
 #include "runtime/libuv.h"
+#endif
 #include "runtime/cadical.h"
 
 namespace lean {
@@ -32,7 +35,9 @@ extern "C" LEAN_EXPORT void lean_initialize_runtime_module() {
     initialize_mutex();
     initialize_process();
     initialize_stack_overflow();
+#ifndef __wasi__
     initialize_libuv();
+#endif
     initialize_cadical();
 }
 void initialize_runtime_module() {

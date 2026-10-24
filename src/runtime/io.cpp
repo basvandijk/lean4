@@ -20,13 +20,15 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #endif
 // Linux include files
 #include <unistd.h> // NOLINT
+#ifndef __wasi__ // no mmap on WASI
 #include <sys/mman.h>
+#endif
 #include <sys/file.h>
 #ifndef LEAN_EMSCRIPTEN
 #include <sys/random.h>
 #endif
 #endif
-#ifndef LEAN_WINDOWS
+#if !defined(LEAN_WINDOWS) && !defined(__wasi__) // no signals on WASI
 #include <csignal>
 #endif
 #include <dirent.h>
@@ -649,6 +651,13 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_write(b_obj_arg h, b_obj_arg 
 #define LEAN_IO_UNLOCK_FILE(fp) _unlock_file(fp)
 #define LEAN_IO_GETC_UNLOCKED(fp) _fgetc_nolock(fp)
 
+#elif defined(__wasi__)
+
+// Without threads there is nothing to lock against.
+#define LEAN_IO_LOCK_FILE(fp)
+#define LEAN_IO_UNLOCK_FILE(fp)
+#define LEAN_IO_GETC_UNLOCKED(fp) getc_unlocked(fp)
+
 #else
 
 #define LEAN_IO_LOCK_FILE(fp) flockfile(fp)
@@ -890,7 +899,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_get_random_bytes (size_t nbytes) {
 
     if (nbytes == 0) return io_result_mk_ok(lean_alloc_sarray(1, 0, 0));
 
-#if !defined(LEAN_WINDOWS)
+#if !defined(LEAN_WINDOWS) && !defined(__wasi__)
     int fd_urandom = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd_urandom < 0) {
         return io_result_mk_error(decode_io_error(errno, lean_mk_ascii_string_unchecked("/dev/urandom")));
@@ -920,6 +929,15 @@ extern "C" LEAN_EXPORT obj_res lean_io_get_random_bytes (size_t nbytes) {
         }
         remain -= read_sz;
         dst += read_sz;
+#elif defined(__wasi__)
+        // WASI has no /dev/urandom; `getentropy` wraps its `random_get`, at most 256 bytes at a time.
+        size_t read_sz = std::min(remain, static_cast<size_t>(256));
+        if (getentropy(dst, read_sz) != 0) {
+            dec_ref(res);
+            return io_result_mk_error(decode_io_error(errno, nullptr));
+        }
+        remain -= read_sz;
+        dst += read_sz;
 #else
     #if defined(LEAN_EMSCRIPTEN)
         // `Crypto.getRandomValues` documents `dest` should be at most 65536 bytes.
@@ -941,7 +959,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_get_random_bytes (size_t nbytes) {
 #endif
     }
 
-#if !defined(LEAN_WINDOWS)
+#if !defined(LEAN_WINDOWS) && !defined(__wasi__)
     close(fd_urandom);
 #endif
     lean_sarray_set_size(res, nbytes);
@@ -1419,6 +1437,8 @@ extern "C" LEAN_EXPORT obj_res lean_io_app_path() {
     object * appPathLean = mk_string(appPath);
     free(appPath);
     return io_result_mk_ok(appPathLean);
+#elif defined(__wasi__)
+    return io_result_mk_error("WASI provides no path to the running application");
 #else
     // Linux version
     char path[PATH_MAX];
@@ -1701,7 +1721,7 @@ void initialize_io() {
     mark_persistent(g_stream_stderr);
     g_stream_stdin  = lean_stream_of_handle(io_wrap_handle(stdin));
     mark_persistent(g_stream_stdin);
-#if !defined(LEAN_WINDOWS) && !defined(LEAN_EMSCRIPTEN)
+#if !defined(LEAN_WINDOWS) && !defined(LEAN_EMSCRIPTEN) && !defined(__wasi__)
     // We want to handle SIGPIPE ourselves
     lean_always_assert(signal(SIGPIPE, SIG_IGN) != SIG_ERR);
 #endif

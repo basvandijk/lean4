@@ -5,13 +5,14 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Author: Sebastian Ullrich
 */
 #pragma once
-#ifndef LEAN_WINDOWS
+// WASI has no signals; stack_overflow.cpp is not built there.
+#if !defined(LEAN_WINDOWS) && !defined(__wasi__)
 #include <csignal>
 #endif
 
 namespace lean {
 class stack_guard {
-#ifndef LEAN_WINDOWS
+#if !defined(LEAN_WINDOWS) && !defined(__wasi__)
     // We need a separate signal stack since we can't use the overflowed stack
     stack_t m_signal_stack;
 #endif

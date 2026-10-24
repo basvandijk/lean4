@@ -62,6 +62,17 @@ size_t get_current_rss() {
 /* ----------------------------------------------------
    End of Windows version
    --------------------------------------------------- */
+#elif defined(__wasi__)
+namespace lean {
+// Linear memory never shrinks, so its size is both the peak and the current footprint.
+size_t get_peak_rss() {
+    return __builtin_wasm_memory_size(0) * 65536;
+}
+
+size_t get_current_rss() {
+    return get_peak_rss();
+}
+}
 #else
 /* ----------------------------------------------------
    Linux/OSX version for get_peak_rss and get_current_rss
