@@ -1274,7 +1274,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_hard_link(b_obj_arg orig, b_obj_arg link)
 }
 
 /* createTempFile : IO (Handle × FilePath) */
-extern "C" LEAN_EXPORT obj_res lean_io_create_tempfile(lean_object * /* w */) {
+extern "C" LEAN_EXPORT obj_res lean_io_create_tempfile() {
     char path[PATH_MAX];
     size_t base_len = PATH_MAX;
     int ret = uv_os_tmpdir(path, &base_len);
@@ -1320,7 +1320,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_create_tempfile(lean_object * /* w */) {
 }
 
 /* createTempDir : IO FilePath */
-extern "C" LEAN_EXPORT obj_res lean_io_create_tempdir(lean_object * /* w */) {
+extern "C" LEAN_EXPORT obj_res lean_io_create_tempdir() {
     char path[PATH_MAX];
     size_t base_len = PATH_MAX;
     int ret = uv_os_tmpdir(path, &base_len);
