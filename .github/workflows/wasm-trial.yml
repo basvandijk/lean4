@@ -1,0 +1,26 @@
+name: Web Assembly trial
+on:
+  push:
+    branches: [wasm-ci-trial]
+jobs:
+  runner-info:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: df -h / /mnt || true
+      - run: free -h
+      - run: nproc
+      - run: uname -a
+      - run: lsb_release -a
+      - run: node --version
+      - run: clang --version
+      - run: cmake --version
+      - run: command -v lld lld-18 || true
+  build-secondary:
+    uses: ./.github/workflows/build-template.yml
+    with:
+      config: |
+        [{"name":"Web Assembly","os":"ubuntu-24.04","CMAKE_OPTIONS":"-DCMAKE_C_COMPILER_WORKS=1 -DSTAGE0_USE_GMP=OFF -DSTAGE0_LEAN_EXTRA_CXX_FLAGS='-m32 -msse2 -mfpmath=sse -DLEAN_DEFAULT_THREAD_STACK_SIZE=33554432' -DSTAGE0_LEANC_OPTS='-m32 -msse2 -mfpmath=sse' -DSTAGE0_LEAN_EXTRA_LINKER_FLAGS=-m32 -DSTAGE0_CMAKE_C_FLAGS=-m32 -DSTAGE0_CMAKE_CXX_COMPILER=clang++ -DSTAGE0_CMAKE_C_COMPILER=clang -DSTAGE0_CMAKE_EXECUTABLE_SUFFIX=\"\" -DSTAGE0_PKG_CONFIG_EXECUTABLE=/usr/bin/i386-linux-gnu-pkg-config -DSTAGE0_CMAKE_LIBRARY_PATH=/usr/lib/i386-linux-gnu/ -DUSE_GMP=OFF -DMMAP=OFF -DSTAGE0_MMAP=OFF -DUSE_MIMALLOC=OFF -DCMAKE_AR=$GITHUB_WORKSPACE/emsdk/emsdk-main/upstream/emscripten/emar -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/emsdk/emsdk-main/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake -DLEAN_INSTALL_SUFFIX=-linux_wasm32","wasm":true,"cmultilib":true,"cross":true,"release":false,"secondary":true,"enabled":true,"test":true,"binary-check":"file","shell":"bash -euxo pipefail {0}","CTEST_OPTIONS":"--no-tests=error --timeout 300 --repeat until-pass:2 -R '^(elab/(10078|11773|11778|1311|13921|13982|14838|15994|1921|2291|303|307|3546|4306|4573|4677|5818|9806|KyleAlg|Ord|Reformat|Uri|bigmul|bitwise|bool2int|bytearray|bytearray_eq|bytearray_order|byteslice|cancel_token|cleanupAnnotations|closure_16_unique|compiler_bug_neutral|computedFields|congrThm3|crashDiv0|csimpCore|currentDir|dateTimeOrd|dbgMacros|decideNative|decideNativePanic|derivingHashable|elimDeadBranchesUInt64Literal|envExtensionNameSearch|errorExplanationElab|filePath|float1|float32|floatBits|floatEquality|floatFma|floatMinMax|float_model_tobits|floatarray|getline_crash|grind_9825|grind_hom_lemmas|grind_lia_split_facts|guard_msgs|hashMapIteratorLoop|hashmap|hlistOverload|idbg_e2e|inlineWithNestedRecIssue|instantiateMVarsCrossScope|instantiateMVarsSharing|intModBug|intNegSucc|int_to_nat_bug|ioNulBytes|ioRandomBytes|json|json2|kernel2|kernelInterrupt|kernelProjIdx|kernel_is_def_eq_equiv_manager_1|kernel_is_def_eq_equiv_manager_2|lcnfInferProjTypeIssue|lean_nat_gcd|lean_nat_powmod|library_suggestions_shared_cache|libuv|lit_value_classify|lit_values|lrat_roundtrip|markdown_case_folding|markdown_character_classes|match_float|meta6|name_eq_bug|ofIntClamp|openssl|optionGetD|patbug|postprocess_traces|ptrAddr|pullInstancesDecidable|rangePolymorphic|rangeSyntaxPrecedence|ranges_infer|readDir|realPath|reduce1|reduce3|runtime_bignum_edge_cases|sarray|sharecommon|sharecommon_mpz|sint-abs|sint_basic|sint_conversions|st_test|stdio|string|string_cases|string_fromUTF8Lossy|string_slice|sym_arith_classify|sym_arith_ground|sym_arith_norm|taskState|task_iterators|task_test|task_test2|task_test_io|tc_cache_check_hits|tc_cache_check_hits_stale|tempfile|thunk|thunkHeartbeats|thunkTaskCasesOn|timeAPI|timeCanonFormats|timeClassOperations|timeFormatRoundTrip|timeFormats|timeHttpDate|timeLimits|timeLocalDateTime|timeNegative|timeOperations|timeOperationsOffset|timeParse|timePosixTzFooter|timeSet|timeSub|timeTzifParse|timeUnitScalar|toExpr|trivial_uint|try_panic|ugetBorrowed|uint64_modular|uintCtors|uintMatch|uint_sint_decidable_quantifiers|unifHintAndTC|unsafeTerm|updateExprIssue|updateLevelIssues|utf8英語|versoDocBlockquoteErrors|versoDocModuleScoped|versoDocRegionReprint|withSetOptionIn)\\.lean|elab_fail/(1825|277a|277b|phashmap_inst_coherence)\\.lean|misc/(lean_ghash|lean_help|lean_unknown_file|lean_unknown_option|lean_version)\\.sh|markdown_conformance)$'","target-stage":1}]
+      nightly: nightly-2026-11-01
+      LEAN_SPECIAL_VERSION_DESC: ''
+      RELEASE_TAG: ''
+    secrets: inherit
